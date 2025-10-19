@@ -166,3 +166,11 @@ cython_debug/
 *.ckpt
 *.pt
 *.pth
+
+/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/special_tokens_map.json
+
+/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/spiece.model
+
+/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer.json
+
+/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer_config.json
