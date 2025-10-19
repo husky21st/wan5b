@@ -2,53 +2,7 @@ import os, torch, json, importlib
 from typing import List
 
 from .downloader import download_models, download_customized_models, Preset_model_id, Preset_model_website
-
-from .sd_text_encoder import SDTextEncoder
-from .sd_unet import SDUNet
-from .sd_vae_encoder import SDVAEEncoder
-from .sd_vae_decoder import SDVAEDecoder
 from .lora import get_lora_loaders
-
-from .sdxl_text_encoder import SDXLTextEncoder, SDXLTextEncoder2
-from .sdxl_unet import SDXLUNet
-from .sdxl_vae_decoder import SDXLVAEDecoder
-from .sdxl_vae_encoder import SDXLVAEEncoder
-
-from .sd3_text_encoder import SD3TextEncoder1, SD3TextEncoder2, SD3TextEncoder3
-from .sd3_dit import SD3DiT
-from .sd3_vae_decoder import SD3VAEDecoder
-from .sd3_vae_encoder import SD3VAEEncoder
-
-from .sd_controlnet import SDControlNet
-from .sdxl_controlnet import SDXLControlNetUnion
-
-from .sd_motion import SDMotionModel
-from .sdxl_motion import SDXLMotionModel
-
-from .svd_image_encoder import SVDImageEncoder
-from .svd_unet import SVDUNet
-from .svd_vae_decoder import SVDVAEDecoder
-from .svd_vae_encoder import SVDVAEEncoder
-
-from .sd_ipadapter import SDIpAdapter, IpAdapterCLIPImageEmbedder
-from .sdxl_ipadapter import SDXLIpAdapter, IpAdapterXLCLIPImageEmbedder
-
-from .hunyuan_dit_text_encoder import HunyuanDiTCLIPTextEncoder, HunyuanDiTT5TextEncoder
-from .hunyuan_dit import HunyuanDiT
-from .hunyuan_video_vae_decoder import HunyuanVideoVAEDecoder
-from .hunyuan_video_vae_encoder import HunyuanVideoVAEEncoder
-
-from .flux_dit import FluxDiT
-from .flux_text_encoder import FluxTextEncoder2
-from .flux_vae import FluxVAEEncoder, FluxVAEDecoder
-from .flux_ipadapter import FluxIpAdapter
-
-from .cog_vae import CogVAEEncoder, CogVAEDecoder
-from .cog_dit import CogDiT
-
-from ..extensions.RIFE import IFNet
-from ..extensions.ESRGAN import RRDBNet
-
 from ..configs.model_config import model_loader_configs, huggingface_model_loader_configs, patch_model_loader_configs
 from .utils import load_state_dict, init_weights_on_device, hash_state_dict_keys, split_state_dict_with_prefix
 
@@ -192,7 +146,8 @@ class ModelDetectorFromSingleFile:
             loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device)
             return loaded_model_names, loaded_models
 
-        return loaded_model_names, loaded_models
+        return [], []
+        # return loaded_model_names, loaded_models
 
 
 
@@ -263,6 +218,8 @@ class ModelDetectorFromHuggingfaceFolder:
         loaded_model_names, loaded_models = [], []
         architectures = config["architectures"] if "architectures" in config else [config["_class_name"]]
         for architecture in architectures:
+            if architecture not in self.architecture_dict:
+                continue
             huggingface_lib, model_name, redirected_architecture = self.architecture_dict[architecture]
             if redirected_architecture is not None:
                 architecture = redirected_architecture
@@ -464,4 +421,3 @@ class ModelManager:
     def to(self, device):
         for model in self.model:
             model.to(device)
-
