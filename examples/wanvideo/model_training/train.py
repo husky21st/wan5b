@@ -1,4 +1,5 @@
 import torch, os, json
+import gc
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig, WanVideoUnit_PromptEmbedder
@@ -70,9 +71,15 @@ class WanTrainingModule(DiffusionTrainingModule):
 
                 self.pipe.text_encoder.to("cpu")
                 self.pipe.load_models_to_device([]) # Offload after encoding
-        # ------------------------------------
 
-        
+        # Text Encoderを削除
+        if self.cached_prompt_emb_cpu is not None:
+            print("Prompt embedding is cached. Deleting text encoder to save memory.")
+            del self.pipe.text_encoder
+            self.pipe.text_encoder = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
     def forward_preprocess(self, data):
         # Move cached embedding to the correct device on first forward pass
         if self.cached_prompt_emb is None and self.cached_prompt_emb_cpu is not None:
@@ -137,7 +144,6 @@ if __name__ == "__main__":
     parser.add_argument("--prompt_emb_cache_path", type=str, default="prompt_emb_cache.pt", help="Path to save/load the cached prompt embedding.")
     args = parser.parse_args()
 
-    # --- データセットパスの組み立て ---
     video_data_path = os.path.join(args.dataset_base_path, "videos")
     metadata_path = os.path.join(video_data_path, "metadata.jsonl")
 
@@ -145,7 +151,6 @@ if __name__ == "__main__":
     if not os.path.exists(metadata_path):
         metadata_path = args.dataset_metadata_path
         video_data_path = args.dataset_base_path
-    # -------------------------------
 
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
