@@ -130,4 +130,5 @@ if __name__ == "__main__":
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
     )
-    launch_training_task(dataset, model, model_logger, args=args)
+    pass
+    # launch_training_task(dataset, model, model_logger, args=args)
