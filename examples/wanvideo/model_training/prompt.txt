@@ -1,0 +1,1 @@
+static orthographic shot | Subject: physical simulation based on classical mechanics. | Scene: pure white background, no additional elements. | Motion: objects fall down under gravity. objects never overlap. on contact they bounce. no splitting or merging. camera is completely static. | Physics: classical gravity, no air resistance. | Style: minimalist 2D schematic, flat shading.

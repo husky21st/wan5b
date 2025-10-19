@@ -1,11 +1,9 @@
 import torch, os, json
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from diffsynth import load_state_dict
-from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
+from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig, WanVideoUnit_PromptEmbedder
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
 from diffsynth.trainers.unified_dataset import UnifiedDataset, LoadVideo, ImageCropAndResize, ToAbsolutePath
-
-
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -19,6 +17,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         extra_inputs=None,
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        prompt_path=None,
+        prompt_emb_cache_path="prompt_emb_cache.pt",
     ):
         super().__init__()
         # Load models
@@ -38,23 +38,61 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
-        
+
+        # --- プロンプトとキャッシュに関する処理 ---
+        self.prompt_emb_cache_path = prompt_emb_cache_path
+        self.prompt = None
+        if prompt_path is not None:
+            with open(prompt_path, "r", encoding="utf-8") as f:
+                self.prompt = f.read().strip()
+
+        self.cached_prompt_emb = None
+        self.cached_prompt_emb_cpu = None
+        if self.prompt is not None:
+            if os.path.exists(self.prompt_emb_cache_path):
+                print(f"Loading cached prompt embedding from {self.prompt_emb_cache_path}")
+                # weights_only=Falseの警告を避けるため、try-exceptで対応
+                try:
+                    self.cached_prompt_emb_cpu = torch.load(self.prompt_emb_cache_path, weights_only=True)
+                except:
+                    self.cached_prompt_emb_cpu = torch.load(self.prompt_emb_cache_path, weights_only=False)
+            else:
+                print("Encoding and caching prompt embedding...")
+                inference_device = "cuda"
+                self.pipe.load_models_to_device(["text_encoder"])
+                self.pipe.text_encoder.to(inference_device)
+
+                prompt_emb = self.pipe.prompter.encode_prompt(self.prompt, positive=True, device=inference_device)
+
+                prompt_emb_cpu = prompt_emb.to("cpu")
+                torch.save(prompt_emb_cpu, self.prompt_emb_cache_path)
+                self.cached_prompt_emb_cpu = prompt_emb_cpu
+
+                self.pipe.text_encoder.to("cpu")
+                self.pipe.load_models_to_device([]) # Offload after encoding
+        # ------------------------------------
+
         
     def forward_preprocess(self, data):
-        # CFG-sensitive parameters
-        inputs_posi = {"prompt": data["prompt"]}
+        # Move cached embedding to the correct device on first forward pass
+        if self.cached_prompt_emb is None and self.cached_prompt_emb_cpu is not None:
+            self.cached_prompt_emb = self.cached_prompt_emb_cpu.to(self.pipe.device)
+
+        # Use cached prompt if available
+        if self.cached_prompt_emb is not None:
+            inputs_posi = {"context": self.cached_prompt_emb}
+        else: # Fallback to original behavior if no prompt is provided
+            inputs_posi = {"prompt": data.get("prompt", "")}
+
         inputs_nega = {}
         
-        # CFG-unsensitive parameters
+        video_key = "file_name" if "file_name" in data else "video"
+
         inputs_shared = {
-            # Assume you are using this pipeline for inference,
-            # please fill in the input parameters.
-            "input_video": data["video"],
-            "height": data["video"][0].size[1],
-            "width": data["video"][0].size[0],
-            "num_frames": len(data["video"]),
-            # Please do not modify the following parameters
-            # unless you clearly know what this will cause.
+            "input_video": data[video_key],
+            "height": data[video_key][0].size[1],
+            "width": data[video_key][0].size[0],
+            "num_frames": len(data[video_key]),
             "cfg_scale": 1,
             "tiled": False,
             "rand_device": self.pipe.device,
@@ -69,9 +107,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         # Extra inputs
         for extra_input in self.extra_inputs:
             if extra_input == "input_image":
-                inputs_shared["input_image"] = data["video"][0]
+                inputs_shared["input_image"] = data[video_key][0]
             elif extra_input == "end_image":
-                inputs_shared["end_image"] = data["video"][-1]
+                inputs_shared["end_image"] = data[video_key][-1]
             elif extra_input == "reference_image" or extra_input == "vace_reference_image":
                 inputs_shared[extra_input] = data[extra_input][0]
             else:
@@ -79,6 +117,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         
         # Pipeline units will automatically process the input parameters.
         for unit in self.pipe.units:
+            # If prompt embedding is already cached, skip the unit that generates it.
+            if isinstance(unit, WanVideoUnit_PromptEmbedder) and self.cached_prompt_emb is not None:
+                continue
             inputs_shared, inputs_posi, inputs_nega = self.pipe.unit_runner(unit, self.pipe, inputs_shared, inputs_posi, inputs_nega)
         return {**inputs_shared, **inputs_posi}
     
@@ -92,14 +133,27 @@ class WanTrainingModule(DiffusionTrainingModule):
 
 if __name__ == "__main__":
     parser = wan_parser()
+    parser.add_argument("--prompt_path", type=str, default=None, help="Path to the fixed prompt text file.")
+    parser.add_argument("--prompt_emb_cache_path", type=str, default="prompt_emb_cache.pt", help="Path to save/load the cached prompt embedding.")
     args = parser.parse_args()
+
+    # --- データセットパスの組み立て ---
+    video_data_path = os.path.join(args.dataset_base_path, "videos")
+    metadata_path = os.path.join(video_data_path, "metadata.jsonl")
+
+    # Fallback to original metadata path if new one doesn't exist
+    if not os.path.exists(metadata_path):
+        metadata_path = args.dataset_metadata_path
+        video_data_path = args.dataset_base_path
+    # -------------------------------
+
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
-        metadata_path=args.dataset_metadata_path,
+        metadata_path=metadata_path,
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
         main_data_operator=UnifiedDataset.default_video_operator(
-            base_path=args.dataset_base_path,
+            base_path=video_data_path, # videosサブディレクトリを指定
             max_pixels=args.max_pixels,
             height=args.height,
             width=args.width,
@@ -125,10 +179,11 @@ if __name__ == "__main__":
         extra_inputs=args.extra_inputs,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        prompt_path=args.prompt_path,
+        prompt_emb_cache_path=args.prompt_emb_cache_path,
     )
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
     )
-    pass
-    # launch_training_task(dataset, model, model_logger, args=args)
+    launch_training_task(dataset, model, model_logger, args=args)

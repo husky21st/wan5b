@@ -1,5 +1,7 @@
 accelerate launch --config_file examples/wanvideo/model_training/accelerate_config_5B.yaml examples/wanvideo/model_training/train.py \
-  --dataset_base_path /data/phyworld/combinatorial_data/new10003 \
+  --dataset_base_path /data/phyworld/combinatorial_data/new10003/train_000 \
+  --data_file_keys "file_name" \
+  --prompt_path "examples/wanvideo/model_training/prompt.txt" \
   --height 512 \
   --width 512 \
   --num_frames 49 \
