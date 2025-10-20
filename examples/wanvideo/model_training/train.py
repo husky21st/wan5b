@@ -221,12 +221,16 @@ if __name__ == "__main__":
     )
 
     # --- 検証ロジックの定義 ---
-    def run_validation(validation_state_dict, current_step, training_module):
-        print(f"  Starting validation for step {current_step}...")
+    def run_validation(validation_state_dict, current_step, training_module, accelerator):
+        # メインプロセスでのみログ出力
+        if accelerator.is_main_process:
+            print(f"  Starting validation for step {current_step}...")
 
         # 1. バックアップとチェックポイントのロード
         pipe_for_validation = training_module.pipe
         lora_base = getattr(pipe_for_validation, args.lora_base_model) if args.lora_base_model else pipe_for_validation.dit
+
+        # すべてのプロセスで元のstate_dictを保持
         original_state_dict_cpu = {k: v.cpu().clone() for k, v in lora_base.state_dict().items()}
 
         if args.lora_base_model:
@@ -234,38 +238,55 @@ if __name__ == "__main__":
         else:
             lora_base.load_state_dict(validation_state_dict, strict=False)
 
-        # 検証用メタデータを読み込む
+        # 検証用メタデータを読み込む (全プロセスで読み込んでも問題ない)
         validation_metadata_path = os.path.join(args.validation_dataset_path, "images", "metadata.jsonl")
-        validation_data = []
+        all_validation_data = []
         with open(validation_metadata_path, 'r') as f:
             for line in f:
-                validation_data.append(json.loads(line.strip()))
+                all_validation_data.append(json.loads(line.strip()))
 
+        # 各プロセスに検証データを分割して割り当てる
+        num_processes = accelerator.num_processes
+        process_index = accelerator.process_index
+        data_per_process = len(all_validation_data) // num_processes
+        start_index = process_index * data_per_process
+        end_index = (process_index + 1) * data_per_process if process_index < num_processes - 1 else len(all_validation_data)
+
+        # 現在のプロセスが担当するデータのサブセット
+        validation_data_subset = all_validation_data[start_index:end_index]
+
+        # メインプロセスでのみ出力ディレクトリを作成
         validation_output_path = os.path.join(args.output_path, "validations", f"step_{current_step}")
-        os.makedirs(validation_output_path, exist_ok=True)
+        if accelerator.is_main_process:
+            os.makedirs(validation_output_path, exist_ok=True)
+        accelerator.wait_for_everyone() # ディレクトリ作成を待つ
 
         # 3. 推論実行
-        pipe_for_validation.to("cuda")
+        pipe_for_validation.to(accelerator.device)
         lora_base.eval()
 
         # デバイス上でキャッシュを準備
-        posi_emb = training_module.cached_prompt_emb_cpu.to("cuda")
-        nega_emb = training_module.cached_nega_prompt_emb_cpu.to("cuda")
+        posi_emb = training_module.cached_prompt_emb_cpu.to(accelerator.device)
+        nega_emb = training_module.cached_nega_prompt_emb_cpu.to(accelerator.device)
 
         with torch.no_grad():
-            # メタデータに基づいてループ
-            for item in validation_data:
+            # メタデータに基づいてループ (割り当てられたサブセットを使用)
+            for item in validation_data_subset:
                 file_name = item["file_name"]
                 item_id = item["id"]
                 image_path = os.path.join(args.validation_dataset_path, "images", file_name)
-                print(f"    Validating with {file_name} (ID: {item_id})...")
+
+                if accelerator.is_main_process: # ログはメインプロセスのみ
+                    print(f"    Validating with {file_name} (ID: {item_id})...")
                 input_image = Image.open(image_path)
 
                 # 各画像に対して5回生成
                 for i in range(5):
-                    seed = 420*item_id + 1139*i # IDとイテレーションからシードを決定
-                    print(f"      Generating video {i+1}/5 with seed {seed}...")
+                    seed = 420*item_id + 1139*i
+                    if accelerator.is_main_process:
+                        print(f"      Generating video {i+1}/5 with seed {seed}...")
 
+                    # 全てのプロセスで推論を実行
                     video = pipe_for_validation(
                         prompt=training_module.prompt,
                         negative_prompt=training_module.negative_prompt,
@@ -277,18 +298,25 @@ if __name__ == "__main__":
                         width=args.width,
                         num_frames=args.num_frames,
                         tiled=True,
-                        cfg_scale=5.0
+                        cfg_scale=5.0,
+                        progress_bar_cmd=lambda x: x # サブプロセスのプログレスバーを無効化
                     )
 
+                    # 全てのプロセスがそれぞれの結果を保存
+                    # ファイル名がユニークなので競合は発生しない
                     output_filename = f"{item_id}_{i}.mp4"
                     save_video(video, os.path.join(validation_output_path, output_filename), fps=10)
+
+        # 全てのプロセスが推論を完了するまで待機
+        accelerator.wait_for_everyone()
 
         lora_base.load_state_dict(original_state_dict_cpu)
         lora_base.train()
         pipe_for_validation.to("cpu")
         gc.collect()
         torch.cuda.empty_cache()
-        print("Validation finished.")
+        if accelerator.is_main_process:
+            print("Validation finished.")
 
     # --- ModelLoggerの初期化 ---
     model_logger = ModelLogger(

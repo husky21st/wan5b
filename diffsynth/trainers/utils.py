@@ -497,21 +497,24 @@ class ModelLogger:
             if accelerator.is_main_process:
                 print(f"Running validation at step {self.num_steps}...")
 
-                # state_dictを取得して検証関数に渡す
-                unwrapped_model = accelerator.unwrap_model(model)
-                state_dict = unwrapped_model.export_trainable_state_dict(
-                    accelerator.get_state_dict(model),
-                    remove_prefix=self.remove_prefix_in_ckpt
-                )
-                state_dict = self.state_dict_converter(state_dict)
+            # すべてのプロセスでstate_dictを取得し、検証関数を実行
+            # これにより、DDPモデル内での同期が保たれる
+            accelerator.wait_for_everyone()
+            unwrapped_model = accelerator.unwrap_model(model)
+            state_dict = unwrapped_model.export_trainable_state_dict(
+                accelerator.get_state_dict(model),
+                remove_prefix=self.remove_prefix_in_ckpt
+            )
+            state_dict = self.state_dict_converter(state_dict)
 
-                # 検証関数を実行
-                self.validation_fn(state_dict, self.num_steps, unwrapped_model)
+            self.validation_fn(state_dict, self.num_steps, unwrapped_model, accelerator)
+        accelerator.wait_for_everyone()
 
 
     def on_epoch_end(self, accelerator, model, epoch_id):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            print(f"Saving model at the end of epoch {epoch_id}...")
             state_dict = accelerator.get_state_dict(model)
             state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
             state_dict = self.state_dict_converter(state_dict)

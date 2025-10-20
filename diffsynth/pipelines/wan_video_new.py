@@ -614,6 +614,7 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
         if input_video is None:
             return {"latents": noise}
         pipe.load_models_to_device(["vae"])
+        pipe.vae.to(pipe.device)
         input_video = pipe.preprocess_video(input_video)
         input_latents = pipe.vae.encode(input_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
         if vace_reference_image is not None:
@@ -757,6 +758,7 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
         if input_image is None or not pipe.dit.fuse_vae_embedding_in_latents:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
+        pipe.vae.to(pipe.device)
         image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
         z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         latents[:, :, 0: 1] = z
