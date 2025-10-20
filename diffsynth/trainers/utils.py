@@ -649,4 +649,5 @@ def wan_parser():
     parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N steps.")
     parser.add_argument("--validation_dataset_path", type=str, default=None, help="Path to the validation dataset (e.g., `test_000`).")
     parser.add_argument("--negative_prompt_path", type=str, default=None, help="Path to the fixed negative prompt text file.")
+    parser.add_argument("--num_validation_videos_per_image", type=int, default=5, help="Number of validation videos to generate per image.")
     return parser

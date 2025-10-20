@@ -56,10 +56,10 @@ class WanTrainingModule(DiffusionTrainingModule):
             with open(negative_prompt_path, "r", encoding="utf-8") as f:
                 self.negative_prompt = f.read().strip()
 
-        self.cached_prompt_emb = None
-        self.cached_nega_prompt_emb = None
-        self.cached_prompt_emb_cpu = None
-        self.cached_nega_prompt_emb_cpu = None
+        self.cached_prompt_emb = None # GPU上のキャッシュ
+        self.cached_nega_prompt_emb = None # GPU上のキャッシュ
+        self.cached_prompt_emb_cpu = None # CPU上のキャッシュ
+        self.cached_nega_prompt_emb_cpu = None # CPU上のキャッシュ
 
         text_encoder_needed = False
         # ポジティブプロンプトのキャッシュ処理
@@ -100,7 +100,7 @@ class WanTrainingModule(DiffusionTrainingModule):
                 torch.save(self.cached_nega_prompt_emb_cpu, self.nega_prompt_emb_cache_path)
 
             self.pipe.text_encoder.to("cpu")
-            self.pipe.load_models_to_device([])
+            self.pipe.load_models_to_device([]) # Text EncoderをCPUに戻す (VAEやDiTが使うVRAMを確保するため)
 
         # Text Encoderを削除
         if self.cached_prompt_emb_cpu is not None:
@@ -108,14 +108,21 @@ class WanTrainingModule(DiffusionTrainingModule):
             del self.pipe.text_encoder
             self.pipe.text_encoder = None
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache() # VRAMを確実に解放
 
     def forward_preprocess(self, data):
         # Move cached embedding to the correct device on first forward pass
+        # ここで `self.pipe.device` は `accelerator.device` に設定されるため、
+        # `accelerator.prepare` 後に初めて`forward`が呼ばれた際に実行される。
         if self.cached_prompt_emb is None and self.cached_prompt_emb_cpu is not None:
             self.cached_prompt_emb = self.cached_prompt_emb_cpu.to(self.pipe.device)
+            del self.cached_prompt_emb_cpu # CPUメモリも解放
+            gc.collect()
         if self.cached_nega_prompt_emb is None and self.cached_nega_prompt_emb_cpu is not None:
             self.cached_nega_prompt_emb = self.cached_nega_prompt_emb_cpu.to(self.pipe.device)
+            del self.cached_nega_prompt_emb_cpu # CPUメモリも解放
+            gc.collect()
+        torch.cuda.empty_cache() # キャッシュ転送後のVRAMを整理
 
         # Use cached prompt.
         inputs_posi = {"context": self.cached_prompt_emb}
@@ -262,12 +269,13 @@ if __name__ == "__main__":
         accelerator.wait_for_everyone() # ディレクトリ作成を待つ
 
         # 3. 推論実行
-        pipe_for_validation.to(accelerator.device)
+        # pipe_for_validation.to(accelerator.device) # 修正: 削除。acceleratorが管理しているため不要
         lora_base.eval()
 
         # デバイス上でキャッシュを準備
-        posi_emb = training_module.cached_prompt_emb_cpu.to(accelerator.device)
-        nega_emb = training_module.cached_nega_prompt_emb_cpu.to(accelerator.device)
+        # ここでは training_module.cached_prompt_emb (GPU上のキャッシュ) を直接使用
+        posi_emb = training_module.cached_prompt_emb
+        nega_emb = training_module.cached_nega_prompt_emb
 
         with torch.no_grad():
             # メタデータに基づいてループ (割り当てられたサブセットを使用)
@@ -280,11 +288,11 @@ if __name__ == "__main__":
                     print(f"    Validating with {file_name} (ID: {item_id})...")
                 input_image = Image.open(image_path)
 
-                # 各画像に対して5回生成
-                for i in range(5):
+                # 各画像に対して複数の動画を生成
+                for i in range(args.num_validation_videos_per_image):
                     seed = 420*item_id + 1139*i
                     if accelerator.is_main_process:
-                        print(f"      Generating video {i+1}/5 with seed {seed}...")
+                        print(f"      Generating video {i+1}/{args.num_validation_videos_per_image} with seed {seed}...")
 
                     # 全てのプロセスで推論を実行
                     video = pipe_for_validation(
@@ -310,11 +318,27 @@ if __name__ == "__main__":
         # 全てのプロセスが推論を完了するまで待機
         accelerator.wait_for_everyone()
 
+        # モデルの状態を学習時に戻す
         lora_base.load_state_dict(original_state_dict_cpu)
-        lora_base.train()
-        pipe_for_validation.to("cpu")
+
+        # 2. パイプライン全体を学習モードに戻す (スケジューラ設定とモデルモード切り替えを含む)
+        # この関数は内部で scheduler.set_timesteps(1000, training=True) と
+        # 各モデルの train()/eval() 切り替えをまとめて行います。
+        training_module.switch_pipe_to_training_mode(
+            pipe=pipe_for_validation,
+            trainable_models=args.trainable_models,
+            lora_base_model=args.lora_base_model,
+            lora_target_modules=args.lora_target_modules,
+            lora_rank=args.lora_rank
+        )
+
+        # --- クリーンアップ ---
         gc.collect()
         torch.cuda.empty_cache()
+
+        # 全てのプロセスが状態復元とクリーンアップを完了するのを待つ
+        accelerator.wait_for_everyone()
+
         if accelerator.is_main_process:
             print("Validation finished.")
 

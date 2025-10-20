@@ -20,4 +20,5 @@ accelerate launch --config_file examples/wanvideo/model_training/accelerate_conf
   --extra_inputs "input_image" \
   --save_steps $((10)) \
   --validation_steps $((10)) \
-  --validation_dataset_path /data/phyworld/combinatorial_data/new10003/test_000
+  --validation_dataset_path /data/phyworld/combinatorial_data/new10003/test_000 \
+  --num_validation_videos_per_image 5
