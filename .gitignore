@@ -174,3 +174,6 @@ cython_debug/
 /models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer.json
 
 /models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer_config.json
+
+*.mp4
+*.png

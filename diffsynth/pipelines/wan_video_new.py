@@ -479,19 +479,31 @@ class WanVideoPipeline(BasePipeline):
         tea_cache_model_id: Optional[str] = "",
         # progress_bar
         progress_bar_cmd=tqdm,
+        context: Optional[torch.Tensor] = None,
+        negative_context: Optional[torch.Tensor] = None,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
         
         # Inputs
         inputs_posi = {
-            "prompt": prompt,
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
+        # contextが提供された場合はpromptを無視
+        if context is not None:
+            inputs_posi["context"] = context
+        else:
+            inputs_posi["prompt"] = prompt
+
         inputs_nega = {
-            "negative_prompt": negative_prompt,
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
+        # negative_contextが提供された場合はnegative_promptを無視
+        if negative_context is not None:
+            inputs_nega["context"] = negative_context
+        else:
+            inputs_nega["negative_prompt"] = negative_prompt
+
         inputs_shared = {
             "input_image": input_image,
             "end_image": end_image,
@@ -510,6 +522,9 @@ class WanVideoPipeline(BasePipeline):
             "animate_pose_video": animate_pose_video, "animate_face_video": animate_face_video, "animate_inpaint_video": animate_inpaint_video, "animate_mask_video": animate_mask_video,
         }
         for unit in self.units:
+            # contextが事前に提供されている場合、PromptEmbedderをスキップ
+            if isinstance(unit, WanVideoUnit_PromptEmbedder) and (context is not None or negative_context is not None):
+                continue
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
 
         # Denoise
@@ -521,10 +536,10 @@ class WanVideoPipeline(BasePipeline):
                 self.load_models_to_device(self.in_iteration_models_2)
                 models["dit"] = self.dit2
                 models["vace"] = self.vace2
-                
+
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            
+
             # Inference
             noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
             if cfg_scale != 1.0:
@@ -540,7 +555,7 @@ class WanVideoPipeline(BasePipeline):
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
             if "first_frame_latents" in inputs_shared:
                 inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
-        
+
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
             if vace_reference_image is not None and isinstance(vace_reference_image, list):
@@ -585,7 +600,7 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
         if vace_reference_image is not None:
             noise = torch.concat((noise[:, :, -f:], noise[:, :, :-f]), dim=2)
         return {"noise": noise}
-    
+
 
 
 class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
@@ -661,7 +676,7 @@ class WanVideoUnit_ImageEmbedder(PipelineUnit):
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
-        
+
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         y = torch.concat([msk, y])
@@ -691,7 +706,7 @@ class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
                 clip_context = torch.concat([clip_context, pipe.image_encoder.encode_image([end_image])], dim=1)
         clip_context = clip_context.to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"clip_feature": clip_context}
-    
+
 
 
 class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
@@ -718,7 +733,7 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
-        
+
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         y = torch.concat([msk, y])
@@ -771,7 +786,7 @@ class WanVideoUnit_FunControl(PipelineUnit):
             y = y[:, -y_dim:]
         y = torch.concat([control_latents, y], dim=1)
         return {"clip_feature": clip_feature, "y": y}
-    
+
 
 
 class WanVideoUnit_FunReference(PipelineUnit):
@@ -809,7 +824,7 @@ class WanVideoUnit_FunCameraControl(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         camera_control_plucker_embedding = pipe.dit.control_adapter.process_camera_coordinates(
             camera_control_direction, num_frames, height, width, camera_control_speed, camera_control_origin)
-        
+
         control_camera_video = camera_control_plucker_embedding[:num_frames].permute([3, 0, 1, 2]).unsqueeze(0)
         control_camera_latents = torch.concat(
             [
@@ -821,7 +836,7 @@ class WanVideoUnit_FunCameraControl(PipelineUnit):
         control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, 4, c, h, w).transpose(2, 3)
         control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, c * 4, h, w).transpose(1, 2)
         control_camera_latents_input = control_camera_latents.to(device=pipe.device, dtype=pipe.torch_dtype)
-        
+
         input_image = input_image.resize((width, height))
         input_latents = pipe.preprocess_video([input_image])
         input_latents = pipe.vae.encode(input_latents, device=pipe.device)
@@ -878,21 +893,21 @@ class WanVideoUnit_VACE(PipelineUnit):
                 vace_video = torch.zeros((1, 3, num_frames, height, width), dtype=pipe.torch_dtype, device=pipe.device)
             else:
                 vace_video = pipe.preprocess_video(vace_video)
-            
+
             if vace_video_mask is None:
                 vace_video_mask = torch.ones_like(vace_video)
             else:
                 vace_video_mask = pipe.preprocess_video(vace_video_mask, min_value=0, max_value=1)
-            
+
             inactive = vace_video * (1 - vace_video_mask) + 0 * vace_video_mask
             reactive = vace_video * vace_video_mask + 0 * (1 - vace_video_mask)
             inactive = pipe.vae.encode(inactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
             reactive = pipe.vae.encode(reactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
             vace_video_latents = torch.concat((inactive, reactive), dim=1)
-            
+
             vace_mask_latents = rearrange(vace_video_mask[0,0], "T (H P) (W Q) -> 1 (P Q) T H W", P=8, Q=8)
             vace_mask_latents = torch.nn.functional.interpolate(vace_mask_latents, size=((vace_mask_latents.shape[2] + 3) // 4, vace_mask_latents.shape[3], vace_mask_latents.shape[4]), mode='nearest-exact')
-            
+
             if vace_reference_image is None:
                 pass
             else:
@@ -906,14 +921,14 @@ class WanVideoUnit_VACE(PipelineUnit):
                 for j in range(f):
                     new_vace_ref_images.append(vace_reference_image[0, :, j:j+1])
                 vace_reference_image = new_vace_ref_images
-                
+
                 vace_reference_latents = pipe.vae.encode(vace_reference_image, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
                 vace_reference_latents = torch.concat((vace_reference_latents, torch.zeros_like(vace_reference_latents)), dim=1)
                 vace_reference_latents = [u.unsqueeze(0) for u in vace_reference_latents]
 
                 vace_video_latents = torch.concat((*vace_reference_latents, vace_video_latents), dim=2)
                 vace_mask_latents = torch.concat((torch.zeros_like(vace_mask_latents[:, :, :f]), vace_mask_latents), dim=2)
-            
+
             vace_context = torch.concat((vace_video_latents, vace_mask_latents), dim=1)
             return {"vace_context": vace_context, "vace_scale": vace_scale}
         else:
@@ -1114,7 +1129,7 @@ class WanVideoPostUnit_AnimateInpaint(PipelineUnit):
             input_params=("animate_inpaint_video", "animate_mask_video", "input_image", "tiled", "tile_size", "tile_stride"),
             onload_model_names=("vae",)
         )
-        
+
     def get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device="cuda"):
         if mask_pixel_values is None:
             msk = torch.zeros(1, (lat_t-1) * 4 + 1, lat_h, lat_w, device=device)
@@ -1134,18 +1149,18 @@ class WanVideoPostUnit_AnimateInpaint(PipelineUnit):
         bg_pixel_values = pipe.preprocess_video(animate_inpaint_video)
         y_reft = pipe.vae.encode(bg_pixel_values, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0].to(dtype=pipe.torch_dtype, device=pipe.device)
         _, lat_t, lat_h, lat_w = y_reft.shape
-        
+
         ref_pixel_values = pipe.preprocess_video([input_image])
         ref_latents = pipe.vae.encode(ref_pixel_values, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
         mask_ref = self.get_i2v_mask(1, lat_h, lat_w, 1, device=pipe.device)
         y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=pipe.device)
-        
+
         mask_pixel_values = 1 - pipe.preprocess_video(animate_mask_video, max_value=1, min_value=0)
         mask_pixel_values = rearrange(mask_pixel_values, "b c t h w -> (b t) c h w")
         mask_pixel_values = torch.nn.functional.interpolate(mask_pixel_values, size=(lat_h, lat_w), mode='nearest')
         mask_pixel_values = rearrange(mask_pixel_values, "(b t) c h w -> b t c h w", b=1)[:,:,0]
         msk_reft = self.get_i2v_mask(lat_t, lat_h, lat_w, 0, mask_pixel_values=mask_pixel_values, device=pipe.device)
-        
+
         y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=pipe.device)
         y = torch.concat([y_ref, y_reft], dim=1).unsqueeze(0)
         return {"y": y}
@@ -1160,7 +1175,7 @@ class TeaCache:
         self.rel_l1_thresh = rel_l1_thresh
         self.previous_residual = None
         self.previous_hidden_states = None
-        
+
         self.coefficients_dict = {
             "Wan2.1-T2V-1.3B": [-5.21862437e+04, 9.23041404e+03, -5.28275948e+02, 1.36987616e+01, -4.99875664e-02],
             "Wan2.1-T2V-14B": [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01],
@@ -1212,7 +1227,7 @@ class TemporalTiler_BCTHW:
         x = torch.ones((length,))
         if border_width == 0:
             return x
-        
+
         shift = 0.5
         if not left_bound:
             x[:border_width] = (torch.arange(border_width) + shift) / border_width
@@ -1225,7 +1240,7 @@ class TemporalTiler_BCTHW:
         t = self.build_1d_mask(T, is_bound[0], is_bound[1], border_width[0])
         mask = repeat(t, "T -> 1 1 T 1 1")
         return mask
-    
+
     def run(self, model_fn, sliding_window_size, sliding_window_stride, computation_device, computation_dtype, model_kwargs, tensor_names, batch_size=None):
         tensor_names = [tensor_name for tensor_name in tensor_names if model_kwargs.get(tensor_name) is not None]
         tensor_dict = {tensor_name: model_kwargs[tensor_name] for tensor_name in tensor_names}

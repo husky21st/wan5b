@@ -1,4 +1,4 @@
-import imageio, os, torch, warnings, torchvision, argparse, json
+import imageio, os, torch, warnings, torchvision, argparse, json, glob
 from ..utils import ModelConfig
 from ..models.utils import load_state_dict
 from peft import LoraConfig, inject_adapter_in_model
@@ -478,17 +478,35 @@ class DiffusionTrainingModule(torch.nn.Module):
 
 
 class ModelLogger:
-    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, validation_fn=None):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
+        self.validation_fn = validation_fn
 
-
-    def on_step_end(self, accelerator, model, save_steps=None):
+    def on_step_end(self, accelerator, model, save_steps=None, validation_steps=None):
         self.num_steps += 1
+
+        # モデル保存
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+
+        # 検証
+        if self.validation_fn is not None and validation_steps is not None and self.num_steps % validation_steps == 0:
+            if accelerator.is_main_process:
+                print(f"Running validation at step {self.num_steps}...")
+
+                # state_dictを取得して検証関数に渡す
+                unwrapped_model = accelerator.unwrap_model(model)
+                state_dict = unwrapped_model.export_trainable_state_dict(
+                    accelerator.get_state_dict(model),
+                    remove_prefix=self.remove_prefix_in_ckpt
+                )
+                state_dict = self.state_dict_converter(state_dict)
+
+                # 検証関数を実行
+                self.validation_fn(state_dict, self.num_steps, unwrapped_model)
 
 
     def on_epoch_end(self, accelerator, model, epoch_id):
@@ -550,7 +568,7 @@ def launch_training_task(
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        for data in tqdm(dataloader, disable=not accelerator.is_main_process):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
@@ -559,8 +577,12 @@ def launch_training_task(
                     loss = model(data)
                 accelerator.backward(loss)
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+
+            if accelerator.sync_gradients:
+                model_logger.on_step_end(accelerator, model, save_steps, args.validation_steps if args else None)
+            accelerator.wait_for_everyone()
+
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
@@ -621,4 +643,7 @@ def wan_parser():
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
+    parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N steps.")
+    parser.add_argument("--validation_dataset_path", type=str, default=None, help="Path to the validation dataset (e.g., `test_000`).")
+    parser.add_argument("--negative_prompt_path", type=str, default=None, help="Path to the fixed negative prompt text file.")
     return parser

@@ -1,10 +1,11 @@
-import torch, os, json
+import torch, os, json, glob
 import gc
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-from diffsynth import load_state_dict
+from diffsynth import load_state_dict, save_video
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig, WanVideoUnit_PromptEmbedder
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
 from diffsynth.trainers.unified_dataset import UnifiedDataset, LoadVideo, ImageCropAndResize, ToAbsolutePath
+from PIL import Image
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -19,6 +20,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
         prompt_path=None,
+        negative_prompt_path=None,
         prompt_emb_cache_path="prompt_emb_cache.pt",
     ):
         super().__init__()
@@ -42,35 +44,63 @@ class WanTrainingModule(DiffusionTrainingModule):
 
         # --- プロンプトとキャッシュに関する処理 ---
         self.prompt_emb_cache_path = prompt_emb_cache_path
-        self.prompt = None
+        self.nega_prompt_emb_cache_path = "nega_" + prompt_emb_cache_path
+
+        self.prompt = ""
         if prompt_path is not None:
             with open(prompt_path, "r", encoding="utf-8") as f:
                 self.prompt = f.read().strip()
 
+        self.negative_prompt = ""
+        if negative_prompt_path is not None:
+            with open(negative_prompt_path, "r", encoding="utf-8") as f:
+                self.negative_prompt = f.read().strip()
+
         self.cached_prompt_emb = None
+        self.cached_nega_prompt_emb = None
         self.cached_prompt_emb_cpu = None
-        if self.prompt is not None:
-            if os.path.exists(self.prompt_emb_cache_path):
-                print(f"Loading cached prompt embedding from {self.prompt_emb_cache_path}")
-                # weights_only=Falseの警告を避けるため、try-exceptで対応
-                try:
-                    self.cached_prompt_emb_cpu = torch.load(self.prompt_emb_cache_path, weights_only=True)
-                except:
-                    self.cached_prompt_emb_cpu = torch.load(self.prompt_emb_cache_path, weights_only=False)
-            else:
-                print("Encoding and caching prompt embedding...")
-                inference_device = "cuda"
-                self.pipe.load_models_to_device(["text_encoder"])
-                self.pipe.text_encoder.to(inference_device)
+        self.cached_nega_prompt_emb_cpu = None
 
+        text_encoder_needed = False
+        # ポジティブプロンプトのキャッシュ処理
+        if os.path.exists(self.prompt_emb_cache_path):
+            print(f"Loading cached prompt embedding from {self.prompt_emb_cache_path}")
+            try:
+                self.cached_prompt_emb_cpu = torch.load(self.prompt_emb_cache_path, weights_only=True)
+            except:
+                self.cached_prompt_emb_cpu = torch.load(self.prompt_emb_cache_path, weights_only=False)
+        else:
+            text_encoder_needed = True
+
+        # ネガティブプロンプトのキャッシュ処理
+        if os.path.exists(self.nega_prompt_emb_cache_path):
+            print(f"Loading cached negative prompt embedding from {self.nega_prompt_emb_cache_path}")
+            try:
+                self.cached_nega_prompt_emb_cpu = torch.load(self.nega_prompt_emb_cache_path, weights_only=True)
+            except:
+                self.cached_nega_prompt_emb_cpu = torch.load(self.nega_prompt_emb_cache_path, weights_only=False)
+        else:
+            text_encoder_needed = True
+
+        # キャッシュが存在しない場合はエンコードして保存
+        if text_encoder_needed:
+            print("Encoding and caching prompt embeddings...")
+            inference_device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.pipe.load_models_to_device(["text_encoder"])
+            self.pipe.text_encoder.to(inference_device)
+
+            if self.cached_prompt_emb_cpu is None:
                 prompt_emb = self.pipe.prompter.encode_prompt(self.prompt, positive=True, device=inference_device)
+                self.cached_prompt_emb_cpu = prompt_emb.to("cpu")
+                torch.save(self.cached_prompt_emb_cpu, self.prompt_emb_cache_path)
 
-                prompt_emb_cpu = prompt_emb.to("cpu")
-                torch.save(prompt_emb_cpu, self.prompt_emb_cache_path)
-                self.cached_prompt_emb_cpu = prompt_emb_cpu
+            if self.cached_nega_prompt_emb_cpu is None:
+                nega_prompt_emb = self.pipe.prompter.encode_prompt(self.negative_prompt, positive=False, device=inference_device)
+                self.cached_nega_prompt_emb_cpu = nega_prompt_emb.to("cpu")
+                torch.save(self.cached_nega_prompt_emb_cpu, self.nega_prompt_emb_cache_path)
 
-                self.pipe.text_encoder.to("cpu")
-                self.pipe.load_models_to_device([]) # Offload after encoding
+            self.pipe.text_encoder.to("cpu")
+            self.pipe.load_models_to_device([])
 
         # Text Encoderを削除
         if self.cached_prompt_emb_cpu is not None:
@@ -84,14 +114,12 @@ class WanTrainingModule(DiffusionTrainingModule):
         # Move cached embedding to the correct device on first forward pass
         if self.cached_prompt_emb is None and self.cached_prompt_emb_cpu is not None:
             self.cached_prompt_emb = self.cached_prompt_emb_cpu.to(self.pipe.device)
+        if self.cached_nega_prompt_emb is None and self.cached_nega_prompt_emb_cpu is not None:
+            self.cached_nega_prompt_emb = self.cached_nega_prompt_emb_cpu.to(self.pipe.device)
 
-        # Use cached prompt if available
-        if self.cached_prompt_emb is not None:
-            inputs_posi = {"context": self.cached_prompt_emb}
-        else: # Fallback to original behavior if no prompt is provided
-            inputs_posi = {"prompt": data.get("prompt", "")}
-
-        inputs_nega = {}
+        # Use cached prompt.
+        inputs_posi = {"context": self.cached_prompt_emb}
+        inputs_nega = {"context": self.cached_nega_prompt_emb}
         
         video_key = "file_name" if "file_name" in data else "video"
 
@@ -122,10 +150,10 @@ class WanTrainingModule(DiffusionTrainingModule):
             else:
                 inputs_shared[extra_input] = data[extra_input]
         
-        # Pipeline units will automatically process the input parameters.
+        # Pipeline units
         for unit in self.pipe.units:
-            # If prompt embedding is already cached, skip the unit that generates it.
-            if isinstance(unit, WanVideoUnit_PromptEmbedder) and self.cached_prompt_emb is not None:
+            # PromptEmbedderは常にスキップ
+            if isinstance(unit, WanVideoUnit_PromptEmbedder):
                 continue
             inputs_shared, inputs_posi, inputs_nega = self.pipe.unit_runner(unit, self.pipe, inputs_shared, inputs_posi, inputs_nega)
         return {**inputs_shared, **inputs_posi}
@@ -144,6 +172,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt_emb_cache_path", type=str, default="prompt_emb_cache.pt", help="Path to save/load the cached prompt embedding.")
     args = parser.parse_args()
 
+    # --- データセット準備 ---
     video_data_path = os.path.join(args.dataset_base_path, "videos")
     metadata_path = os.path.join(video_data_path, "metadata.jsonl")
 
@@ -158,7 +187,7 @@ if __name__ == "__main__":
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
         main_data_operator=UnifiedDataset.default_video_operator(
-            base_path=video_data_path, # videosサブディレクトリを指定
+            base_path=video_data_path,
             max_pixels=args.max_pixels,
             height=args.height,
             width=args.width,
@@ -172,6 +201,8 @@ if __name__ == "__main__":
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16))
         }
     )
+
+    # --- モデル初期化 ---
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -185,10 +216,86 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
         prompt_path=args.prompt_path,
+        negative_prompt_path=args.negative_prompt_path,
         prompt_emb_cache_path=args.prompt_emb_cache_path,
     )
+
+    # --- 検証ロジックの定義 ---
+    def run_validation(validation_state_dict, current_step, training_module):
+        print(f"  Starting validation for step {current_step}...")
+
+        # 1. バックアップとチェックポイントのロード
+        pipe_for_validation = training_module.pipe
+        lora_base = getattr(pipe_for_validation, args.lora_base_model) if args.lora_base_model else pipe_for_validation.dit
+        original_state_dict_cpu = {k: v.cpu().clone() for k, v in lora_base.state_dict().items()}
+
+        if args.lora_base_model:
+            pipe_for_validation.load_lora(lora_base, state_dict=validation_state_dict, alpha=1.0)
+        else:
+            lora_base.load_state_dict(validation_state_dict, strict=False)
+
+        # 検証用メタデータを読み込む
+        validation_metadata_path = os.path.join(args.validation_dataset_path, "images", "metadata.jsonl")
+        validation_data = []
+        with open(validation_metadata_path, 'r') as f:
+            for line in f:
+                validation_data.append(json.loads(line.strip()))
+
+        validation_output_path = os.path.join(args.output_path, "validations", f"step_{current_step}")
+        os.makedirs(validation_output_path, exist_ok=True)
+
+        # 3. 推論実行
+        pipe_for_validation.to("cuda")
+        lora_base.eval()
+
+        # デバイス上でキャッシュを準備
+        posi_emb = training_module.cached_prompt_emb_cpu.to("cuda")
+        nega_emb = training_module.cached_nega_prompt_emb_cpu.to("cuda")
+
+        with torch.no_grad():
+            # メタデータに基づいてループ
+            for item in validation_data:
+                file_name = item["file_name"]
+                item_id = item["id"]
+                image_path = os.path.join(args.validation_dataset_path, "images", file_name)
+                print(f"    Validating with {file_name} (ID: {item_id})...")
+                input_image = Image.open(image_path)
+
+                # 各画像に対して5回生成
+                for i in range(5):
+                    seed = 420*item_id + 1139*i # IDとイテレーションからシードを決定
+                    print(f"      Generating video {i+1}/5 with seed {seed}...")
+
+                    video = pipe_for_validation(
+                        prompt=training_module.prompt,
+                        negative_prompt=training_module.negative_prompt,
+                        context=posi_emb,
+                        negative_context=nega_emb,
+                        input_image=input_image,
+                        seed=seed,
+                        height=args.height,
+                        width=args.width,
+                        num_frames=args.num_frames,
+                        tiled=True,
+                        cfg_scale=5.0
+                    )
+
+                    output_filename = f"{item_id}_{i}.mp4"
+                    save_video(video, os.path.join(validation_output_path, output_filename), fps=10)
+
+        lora_base.load_state_dict(original_state_dict_cpu)
+        lora_base.train()
+        pipe_for_validation.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("Validation finished.")
+
+    # --- ModelLoggerの初期化 ---
     model_logger = ModelLogger(
         args.output_path,
-        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
+        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        validation_fn=run_validation if (args.validation_steps is not None and args.validation_dataset_path is not None) else None
     )
+
+    # --- 学習の開始 ---
     launch_training_task(dataset, model, model_logger, args=args)
