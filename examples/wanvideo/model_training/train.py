@@ -245,30 +245,6 @@ if __name__ == "__main__":
         else:
             lora_base.load_state_dict(validation_state_dict, strict=False)
 
-        # 検証用メタデータを読み込む (全プロセスで読み込んでも問題ない)
-        validation_metadata_path = os.path.join(args.validation_dataset_path, "images", "metadata.jsonl")
-        all_validation_data = []
-        with open(validation_metadata_path, 'r') as f:
-            for line in f:
-                all_validation_data.append(json.loads(line.strip()))
-
-        # 各プロセスに検証データを分割して割り当てる
-        num_processes = accelerator.num_processes
-        process_index = accelerator.process_index
-        data_per_process = len(all_validation_data) // num_processes
-        start_index = process_index * data_per_process
-        end_index = (process_index + 1) * data_per_process if process_index < num_processes - 1 else len(all_validation_data)
-
-        # 現在のプロセスが担当するデータのサブセット
-        validation_data_subset = all_validation_data[start_index:end_index]
-
-        # メインプロセスでのみ出力ディレクトリを作成
-        validation_output_path = os.path.join(args.output_path, "validations", f"step_{current_step}")
-        if accelerator.is_main_process:
-            os.makedirs(validation_output_path, exist_ok=True)
-        accelerator.wait_for_everyone() # ディレクトリ作成を待つ
-
-        # 3. 推論実行
         # pipe_for_validation.to(accelerator.device) # 修正: 削除。acceleratorが管理しているため不要
         lora_base.eval()
 
@@ -277,43 +253,83 @@ if __name__ == "__main__":
         posi_emb = training_module.cached_prompt_emb
         nega_emb = training_module.cached_nega_prompt_emb
 
-        with torch.no_grad():
-            # メタデータに基づいてループ (割り当てられたサブセットを使用)
-            for item in validation_data_subset:
-                file_name = item["file_name"]
-                item_id = item["id"]
-                image_path = os.path.join(args.validation_dataset_path, "images", file_name)
+        # 検証用メタデータを読み込む (全プロセスで読み込んでも問題ない)
+        for validation_path in args.validation_dataset_path:
+            dataset_name = os.path.basename(validation_path)
+            if accelerator.is_main_process:
+                print(f"  Validating with dataset: {dataset_name}")
 
-                if accelerator.is_main_process: # ログはメインプロセスのみ
-                    print(f"    Validating with {file_name} (ID: {item_id})...")
-                input_image = Image.open(image_path)
+            validation_metadata_path = os.path.join(validation_path, "images", "metadata.jsonl")
+            if not os.path.exists(validation_metadata_path):
+                if accelerator.is_main_process:
+                    print(f"    Warning: metadata.jsonl not found in {validation_path}/images. Skipping this dataset.")
+                continue
 
-                # 各画像に対して複数の動画を生成
-                for i in range(args.num_validation_videos_per_image):
-                    seed = 420*item_id + 1139*i
-                    if accelerator.is_main_process:
-                        print(f"      Generating video {i+1}/{args.num_validation_videos_per_image} with seed {seed}...")
+            all_validation_data = []
+            with open(validation_metadata_path, 'r') as f:
+                for line in f:
+                    all_validation_data.append(json.loads(line.strip()))
 
-                    # 全てのプロセスで推論を実行
-                    video = pipe_for_validation(
-                        prompt=training_module.prompt,
-                        negative_prompt=training_module.negative_prompt,
-                        context=posi_emb,
-                        negative_context=nega_emb,
-                        input_image=input_image,
-                        seed=seed,
-                        height=args.height,
-                        width=args.width,
-                        num_frames=args.num_frames,
-                        tiled=True,
-                        cfg_scale=5.0,
-                        progress_bar_cmd=lambda x: x # サブプロセスのプログレスバーを無効化
-                    )
+            # 各プロセスに検証データを分割して割り当てる
+            num_processes = accelerator.num_processes
+            process_index = accelerator.process_index
+            data_per_process = len(all_validation_data) // num_processes
+            start_index = process_index * data_per_process
+            end_index = (process_index + 1) * data_per_process if process_index < num_processes - 1 else len(all_validation_data)
 
-                    # 全てのプロセスがそれぞれの結果を保存
-                    # ファイル名がユニークなので競合は発生しない
-                    output_filename = f"{item_id}_{i}.mp4"
-                    save_video(video, os.path.join(validation_output_path, output_filename), fps=10)
+            # 現在のプロセスが担当するデータのサブセット
+            validation_data_subset = all_validation_data[start_index:end_index]
+
+            # メインプロセスでのみ出力ディレクトリを作成
+            validation_output_path = os.path.join(args.output_path, "validations", f"step_{current_step}", dataset_name)
+            if accelerator.is_main_process:
+                os.makedirs(validation_output_path, exist_ok=True)
+            accelerator.wait_for_everyone() # ディレクトリ作成を待つ
+
+            # 3. 推論実行
+            with torch.no_grad():
+                # メタデータに基づいてループ (割り当てられたサブセットを使用)
+                for item in validation_data_subset:
+                    file_name = item["file_name"]
+                    item_id = item["id"]
+                    image_path = os.path.join(validation_path, "images", file_name)
+
+                    if accelerator.is_main_process: # ログはメインプロセスのみ
+                        print(f"    Validating with {file_name} (ID: {item_id})...")
+
+                    if not os.path.exists(image_path):
+                        if accelerator.is_main_process:
+                            print(f"      Warning: Image file not found at {image_path}. Skipping.")
+                        continue
+
+                    input_image = Image.open(image_path)
+
+                    # 各画像に対して複数の動画を生成
+                    for i in range(args.num_validation_videos_per_image):
+                        seed = 420*item_id + 1139*i
+                        if accelerator.is_main_process:
+                            print(f"      Generating video {i+1}/{args.num_validation_videos_per_image} with seed {seed}...")
+
+                        # 全てのプロセスで推論を実行
+                        video = pipe_for_validation(
+                            prompt=training_module.prompt,
+                            negative_prompt=training_module.negative_prompt,
+                            context=posi_emb,
+                            negative_context=nega_emb,
+                            input_image=input_image,
+                            seed=seed,
+                            height=args.height,
+                            width=args.width,
+                            num_frames=args.num_frames,
+                            tiled=True,
+                            cfg_scale=5.0,
+                            progress_bar_cmd=lambda x: x # サブプロセスのプログレスバーを無効化
+                        )
+
+                        # 全てのプロセスがそれぞれの結果を保存
+                        # ファイル名がユニークなので競合は発生しない
+                        output_filename = f"{item_id}_{i}.mp4"
+                        save_video(video, os.path.join(validation_output_path, output_filename), fps=10)
 
         # 全てのプロセスが推論を完了するまで待機
         accelerator.wait_for_everyone()
@@ -338,7 +354,6 @@ if __name__ == "__main__":
 
         # 全てのプロセスが状態復元とクリーンアップを完了するのを待つ
         accelerator.wait_for_everyone()
-
         if accelerator.is_main_process:
             print("Validation finished.")
 
@@ -346,7 +361,8 @@ if __name__ == "__main__":
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
-        validation_fn=run_validation if (args.validation_steps is not None and args.validation_dataset_path is not None) else None
+        validation_fn=run_validation if (args.validation_steps is not None and args.validation_dataset_path is not None) else None,
+        max_checkpoints=10
     )
 
     # --- 学習の開始 ---

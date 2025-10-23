@@ -478,19 +478,43 @@ class DiffusionTrainingModule(torch.nn.Module):
 
 
 class ModelLogger:
-    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, validation_fn=None):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, validation_fn=None, max_checkpoints=10):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
         self.validation_fn = validation_fn
+        self.max_checkpoints = max_checkpoints
+
+    def _manage_checkpoints(self):
+        """ Keeps only the latest `max_checkpoints` step-based checkpoints. """
+        if self.max_checkpoints is None or self.max_checkpoints <= 0:
+            return
+
+        checkpoints = glob.glob(os.path.join(self.output_path, "step-*.safetensors"))
+
+        # ステップ数でソート
+        try:
+            checkpoints.sort(key=lambda f: int(os.path.basename(f).replace('step-', '').replace('.safetensors', '')))
+        except (ValueError, IndexError):
+            print("Warning: Could not sort checkpoints due to unexpected file name format.")
+            return
+
+        if len(checkpoints) > self.max_checkpoints:
+            num_to_delete = len(checkpoints) - self.max_checkpoints
+            for ckpt_path in checkpoints[:num_to_delete]:
+                print(f"Deleting old step checkpoint: {ckpt_path}")
+                try:
+                    os.remove(ckpt_path)
+                except OSError as e:
+                    print(f"Error deleting file {ckpt_path}: {e}")
 
     def on_step_end(self, accelerator, model, save_steps=None, validation_steps=None):
         self.num_steps += 1
 
         # モデル保存
         if save_steps is not None and self.num_steps % save_steps == 0:
-            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors", manage_checkpoints=True) # manage_checkpointsフラグを追加
 
         # 検証
         if self.validation_fn is not None and validation_steps is not None and self.num_steps % validation_steps == 0:
@@ -521,14 +545,14 @@ class ModelLogger:
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
             accelerator.save(state_dict, path, safe_serialization=True)
-
+            print(f"Saved model checkpoint to {path}") # ログを追加
 
     def on_training_end(self, accelerator, model, save_steps=None):
         if save_steps is not None and self.num_steps % save_steps != 0:
-            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors", manage_checkpoints=True)
 
 
-    def save_model(self, accelerator, model, file_name):
+    def save_model(self, accelerator, model, file_name, manage_checkpoints=False):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             state_dict = accelerator.get_state_dict(model)
@@ -537,6 +561,9 @@ class ModelLogger:
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+            print(f"Saved model checkpoint to {path}")
+            if manage_checkpoints:
+                self._manage_checkpoints()
 
 
 def launch_training_task(
@@ -647,7 +674,7 @@ def wan_parser():
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--validation_steps", type=int, default=None, help="Run validation every N steps.")
-    parser.add_argument("--validation_dataset_path", type=str, default=None, help="Path to the validation dataset (e.g., `test_000`).")
     parser.add_argument("--negative_prompt_path", type=str, default=None, help="Path to the fixed negative prompt text file.")
     parser.add_argument("--num_validation_videos_per_image", type=int, default=5, help="Number of validation videos to generate per image.")
+    parser.add_argument("--validation_dataset_path", type=str, nargs='+', default=None, help="Path(s) to the validation dataset(s) (e.g., test_000 test_990).")
     return parser

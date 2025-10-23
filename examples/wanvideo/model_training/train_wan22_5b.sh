@@ -18,7 +18,7 @@ accelerate launch --config_file examples/wanvideo/model_training/accelerate_conf
   --output_path "$OUTPUT_PATH" \
   --trainable_models "dit" \
   --extra_inputs "input_image" \
-  --save_steps $((10)) \
-  --validation_steps $((10)) \
-  --validation_dataset_path /data/phyworld/combinatorial_data/new10003/test_000 \
+  --save_steps $((495)) \
+  --validation_steps $((495)) \
+  --validation_dataset_path /data/phyworld/combinatorial_data/new10003/test_000 /data/phyworld/combinatorial_data/new10003/test_090 \
   --num_validation_videos_per_image 5
